@@ -4,10 +4,15 @@ namespace Kodeine\Metable;
 
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Collection as BaseCollection;
+use Illuminate\Support\Str;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 
 trait Metable
 {
+    
+    // Static property registration sigleton for save observation and slow large set hotfix
+    public static $_isObserverRegistered;
+    public static $_columnNames;
 
     /**
      * Meta scope for easier join
@@ -103,7 +108,17 @@ trait Metable
 
         $getMeta = 'getMeta'.ucfirst(strtolower(gettype($key)));
 
-        return $this->$getMeta($key, $raw);
+        // Default value is used if getMeta is null
+        return $this->$getMeta($key, $raw) ?? $this->getMetaDefaultValue($key);
+    }
+
+    // Returns either the default value or null if default isn't set
+    private function getMetaDefaultValue($key) {
+          if(isset($this->defaultMetaValues) && array_key_exists($key, $this->defaultMetaValues)) {
+            return $this->defaultMetaValues[$key];
+        } else {
+            return null;
+        }
     }
 
     protected function getMetaString($key, $raw = false)
@@ -150,7 +165,8 @@ trait Metable
      */
     public function metas()
     {
-        $model = new \Kodeine\Metable\MetaData();
+        $classname = $this->getMetaClass();
+        $model = new $classname;
         $model->setTable($this->getMetaTable());
 
         return new HasMany($model->newQuery(), $this, $this->getMetaKeyName(), $this->getKeyName());
@@ -174,15 +190,19 @@ trait Metable
      */
     protected function setObserver()
     {
-        $this->saved(function ($model) {
-            $model->saveMeta();
-        });
+        if(!isset(self::$_isObserverRegistered)) {
+            $this->saved(function ($model) {
+                $model->saveMeta();
+            });
+            self::$_isObserverRegistered = true;
+        }
     }
 
     protected function getModelStub()
     {
         // get new meta model instance
-        $model = new \Kodeine\Metable\MetaData();
+        $classname = $this->getMetaClass();
+        $model = new $classname;
         $model->setTable($this->metaTable);
 
         // model fill with attributes.
@@ -255,11 +275,21 @@ trait Metable
     /**
      * Return the table name.
      *
-     * @return null
+     * @return string
      */
     protected function getMetaTable()
     {
         return isset($this->metaTable) ? $this->metaTable : $this->getTable().'_meta';
+    }
+
+    /**
+     * Return the model class name.
+     *
+     * @return string
+     */
+    protected function getMetaClass()
+    {
+        return isset($this->metaClass) ? $this->metaClass : MetaData::class;
     }
 
     /**
@@ -269,9 +299,11 @@ trait Metable
      */
     public function toArray()
     {
-        return array_merge(parent::toArray(), [
-            'meta_data' => $this->getMeta()->toArray(),
-        ]);
+        return $this->hideMeta ?
+            parent::toArray() :
+            array_merge(parent::toArray(), [
+                'meta_data' => $this->getMeta()->toArray(),
+            ]);
     }
 
     /**
@@ -298,6 +330,31 @@ trait Metable
         return $this->getMeta($key);
     }
 
+    /**
+     * Set attributes for the model
+     *
+     * @param array $attributes
+     *
+     * @return void
+     */
+    public function setAttributes(array $attributes) {
+        foreach ($attributes as $key => $value) {
+            $this->$key = $value;
+        }
+    }
+    
+    /**
+     * Determine if model table has a given column.
+     * 
+     * @param  [string]  $column
+     * 
+     * @return boolean
+     */
+    public function hasColumn($column) {
+        if(empty(self::$_columnNames)) self::$_columnNames = array_map('strtolower',\Schema::connection($this->connection)->getColumnListing($this->getTable()));
+        return in_array(strtolower($column), self::$_columnNames);
+    }
+
     public function __unset($key)
     {
         // unset attributes and relations
@@ -314,7 +371,7 @@ trait Metable
     public function __get($attr)
     {
         // Check for meta accessor
-        $accessor = camel_case('get_'.$attr.'_meta');
+        $accessor = Str::camel('get_'.$attr.'_meta');
 
         if (method_exists($this, $accessor)) {
             return $this->{$accessor}();
@@ -336,7 +393,7 @@ trait Metable
     public function __set($key, $value)
     {
         // ignore the trait properties being set.
-        if (starts_with($key, 'meta') || $key == 'query') {
+        if (Str::startsWith($key, 'meta') || $key == 'query') {
             $this->$key = $value;
 
             return;
@@ -349,8 +406,20 @@ trait Metable
             return;
         }
 
+        // If there is a default value, remove the meta row instead - future returns of
+        // this value will be handled via the default logic in the accessor
+        if(
+            isset($this->defaultMetaValues) &&
+            array_key_exists($key, $this->defaultMetaValues) &&
+            $this->defaultMetaValues[$key] == $value
+        ) {
+          $this->unsetMeta($key);
+
+          return;
+        }
+
         // if the key has a mutator execute it
-        $mutator = camel_case('set_'.$key.'_meta');
+        $mutator = Str::camel('set_'.$key.'_meta');
 
         if (method_exists($this, $mutator)) {
             $this->{$mutator}($value);
@@ -370,7 +439,7 @@ trait Metable
         }
 
         // if model table has the column named to the key
-        if (\Schema::hasColumn($this->getTable(), $key)) {
+        if ($this->hasColumn($key)) {
             parent::setAttribute($key, $value);
 
             return;
@@ -385,13 +454,20 @@ trait Metable
     public function __isset($key)
     {
         // trait properties.
-        if (starts_with($key, 'meta') || $key == 'query') {
+        if (Str::startsWith($key, 'meta') || $key == 'query') {
             return isset($this->{$key});
         }
 
         // check parent first.
         if (parent::__isset($key) === true) {
             return true;
+        }
+
+
+        // Keys with default values always "exist" from the perspective
+        // of the end calling function, even if the DB row doesn't exist
+        if(isset($this->defaultMetaValues) && array_key_exists($key, $this->defaultMetaValues)) {
+          return true;
         }
 
         // lets check meta data.
